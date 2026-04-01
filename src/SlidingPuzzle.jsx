@@ -20,13 +20,20 @@ const STYLES = `
   .pz-tile:active { transform: scale(0.85); }
   .pz-tile.empty { background: transparent !important; border-color: transparent !important; cursor: default; pointer-events: none; }
   .pz-tile.correct { background: #eaf3de !important; border-color: #97c459 !important; color: #3b6d11 !important; }
-  .pz-actions { display: flex; gap: 8px; }
+  .pz-tile.hint { background: #fff8e1 !important; border-color: #ffc107 !important; color: #795548 !important; transform: scale(0.95); }
+  .pz-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+  .pz-actions2 { display: flex; gap: 8px; }
   .pz-btn { flex: 1; padding: 12px; border-radius: 8px; border: 1px solid #ccc; background: #fff; font-family: 'Space Mono', monospace; font-size: 12px; letter-spacing: 0.08em; cursor: pointer; font-weight: 700; transition: background 0.12s, transform 0.1s; }
   .pz-btn:hover { background: #f5f5f5; }
   .pz-btn:active { transform: scale(0.97); }
+  .pz-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   .pz-btn.primary { background: #111; color: #fff; border-color: transparent; }
   .pz-btn.primary:hover { opacity: 0.85; }
+  .pz-info { font-size: 11px; font-family: 'Space Mono', monospace; color: #888; text-align: center; margin-top: 10px; min-height: 16px; }
+  .pz-info.solving { color: #1565c0; }
 `;
+
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 function isSolvable(arr) {
   let inv = 0;
@@ -58,14 +65,77 @@ function fmtTime(s) {
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 }
 
+// ── A* solver ────────────────────────────────────────────────────────────────
+// Heuristic: Manhattan distance
+
+function manhattan(arr) {
+  let dist = 0;
+  for (let i = 0; i < 9; i++) {
+    if (arr[i] === 0) continue;
+    const goal = arr[i] - 1;
+    dist +=
+      Math.abs(Math.floor(i / 3) - Math.floor(goal / 3)) +
+      Math.abs((i % 3) - (goal % 3));
+  }
+  return dist;
+}
+
+function getNeighbors(arr) {
+  const neighbors = [];
+  const empty = arr.indexOf(0);
+  const r = Math.floor(empty / 3), c = empty % 3;
+  for (const [dr, dc] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+    const nr = r + dr, nc = c + dc;
+    if (nr < 0 || nr > 2 || nc < 0 || nc > 2) continue;
+    const ni = nr * 3 + nc;
+    const next = [...arr];
+    [next[empty], next[ni]] = [next[ni], next[empty]];
+    neighbors.push({ state: next, moved: ni });
+  }
+  return neighbors;
+}
+
+function aStar(start) {
+  const goalKey = "1,2,3,4,5,6,7,8,0";
+  if (start.join(",") === goalKey) return [];
+
+  // open list as a simple sorted array — fine for 8-puzzle (max depth ~31)
+  const open = [{ state: start, g: 0, h: manhattan(start), path: [] }];
+  const visited = new Set([start.join(",")]);
+
+  while (open.length) {
+    open.sort((a, b) => (a.g + a.h) - (b.g + b.h));
+    const { state, g, path } = open.shift();
+
+    for (const { state: next, moved } of getNeighbors(state)) {
+      const nk = next.join(",");
+      if (visited.has(nk)) continue;
+      const newPath = [...path, moved];
+      if (nk === goalKey) return newPath;
+      visited.add(nk);
+      open.push({ state: next, g: g + 1, h: manhattan(next), path: newPath });
+    }
+  }
+  return null;
+}
+
+// ── Component ────────────────────────────────────────────────────────────────
+
 export default function SlidingPuzzle3x3() {
-  const [tiles, setTiles] = useState(() => makeShuffle());
-  const [moves, setMoves] = useState(0);
-  const [seconds, setSeconds] = useState(0);
-  const [running, setRunning] = useState(false);
-  const [won, setWon] = useState(false);
-  const [best, setBest] = useState(null);
-  const timerRef = useRef(null);
+  const [tiles, setTiles]         = useState(() => makeShuffle());
+  const [moves, setMoves]         = useState(0);
+  const [seconds, setSeconds]     = useState(0);
+  const [running, setRunning]     = useState(false);
+  const [won, setWon]             = useState(false);
+  const [best, setBest]           = useState(null);
+  const [solving, setSolving]     = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+  const [hintIdx, setHintIdx]     = useState(null);
+
+  const timerRef   = useRef(null);
+  const solveRef   = useRef(null);
+  const tilesRef   = useRef(tiles);
+  tilesRef.current = tiles;
 
   useEffect(() => {
     if (running) {
@@ -76,21 +146,36 @@ export default function SlidingPuzzle3x3() {
     return () => clearInterval(timerRef.current);
   }, [running]);
 
+  useEffect(() => () => {
+    clearInterval(timerRef.current);
+    clearInterval(solveRef.current);
+  }, []);
+
+  const stopSolve = () => {
+    clearInterval(solveRef.current);
+    setSolving(false);
+  };
+
   const reset = useCallback((doShuffle) => {
+    stopSolve();
     clearInterval(timerRef.current);
     setTiles(doShuffle ? makeShuffle() : [1,2,3,4,5,6,7,8,0]);
     setMoves(0);
     setSeconds(0);
     setRunning(false);
     setWon(false);
+    setHintIdx(null);
+    setStatusMsg("");
   }, []);
 
   const handleClick = (idx) => {
-    if (won || tiles[idx] === 0) return;
+    if (won || solving || tiles[idx] === 0) return;
     const emptyIdx = tiles.indexOf(0);
     const r1 = Math.floor(idx / 3), c1 = idx % 3;
     const r2 = Math.floor(emptyIdx / 3), c2 = emptyIdx % 3;
-    const adjacent = (r1 === r2 && Math.abs(c1 - c2) === 1) || (c1 === c2 && Math.abs(r1 - r2) === 1);
+    const adjacent =
+      (r1 === r2 && Math.abs(c1 - c2) === 1) ||
+      (c1 === c2 && Math.abs(r1 - r2) === 1);
     if (!adjacent) return;
 
     const next = [...tiles];
@@ -98,13 +183,59 @@ export default function SlidingPuzzle3x3() {
     const newMoves = moves + 1;
     setTiles(next);
     setMoves(newMoves);
+    setHintIdx(null);
     if (!running) setRunning(true);
 
     if (isSolved(next)) {
       setRunning(false);
       setWon(true);
       setBest((prev) => (prev === null || seconds < prev ? seconds : prev));
+      setStatusMsg("");
     }
+  };
+
+  // show the next optimal tile to move
+  const handleHint = () => {
+    if (won || solving) return;
+    const path = aStar(tiles);
+    if (!path || path.length === 0) return;
+    setHintIdx(path[0]);
+    setStatusMsg("Hint: tap the highlighted tile");
+  };
+
+  // animate the full A* solution step by step
+  const handleSolve = () => {
+    if (solving) { stopSolve(); setStatusMsg("Stopped."); return; }
+    if (won) return;
+
+    const path = aStar(tiles);
+    if (!path || path.length === 0) { setStatusMsg("Already solved!"); return; }
+
+    setSolving(true);
+    setHintIdx(null);
+    setStatusMsg(`A* found solution in ${path.length} moves…`);
+    if (!running) setRunning(true);
+
+    let step = 0;
+    solveRef.current = setInterval(() => {
+      const moveIdx = path[step];
+      const cur = tilesRef.current;
+      const emptyIdx = cur.indexOf(0);
+      const next = [...cur];
+      [next[moveIdx], next[emptyIdx]] = [next[emptyIdx], next[moveIdx]];
+      setTiles(next);
+      setMoves((m) => m + 1);
+      step++;
+
+      if (step >= path.length) {
+        clearInterval(solveRef.current);
+        setSolving(false);
+        setRunning(false);
+        setWon(true);
+        setStatusMsg(`Solved by A* in ${path.length} moves!`);
+        setBest((prev) => (prev === null || seconds < prev ? seconds : prev));
+      }
+    }, 350);
   };
 
   return (
@@ -136,22 +267,63 @@ export default function SlidingPuzzle3x3() {
 
         <div className="pz-board-wrap">
           <div className="pz-board">
-            {tiles.map((val, idx) => (
-              <div
-                key={idx}
-                className={`pz-tile${val === 0 ? " empty" : ""}${val !== 0 && val === idx + 1 ? " correct" : ""}`}
-                onClick={() => handleClick(idx)}
-              >
-                {val !== 0 ? val : ""}
-              </div>
-            ))}
+            {tiles.map((val, idx) => {
+              const isEmpty   = val === 0;
+              const isCorrect = !isEmpty && val === idx + 1;
+              const isHint    = !isEmpty && idx === hintIdx;
+              return (
+                <div
+                  key={idx}
+                  className={
+                    "pz-tile" +
+                    (isEmpty   ? " empty"   : "") +
+                    (isCorrect ? " correct" : "") +
+                    (isHint    ? " hint"    : "")
+                  }
+                  onClick={() => handleClick(idx)}
+                >
+                  {isEmpty ? "" : val}
+                </div>
+              );
+            })}
           </div>
         </div>
 
+        {/* row 1: shuffle + reset */}
         <div className="pz-actions">
-          <button className="pz-btn primary" onClick={() => reset(true)}>SHUFFLE</button>
-          <button className="pz-btn" onClick={() => reset(false)}>RESET</button>
+          <button className="pz-btn primary" onClick={() => reset(true)} disabled={solving}>
+            SHUFFLE
+          </button>
+          <button className="pz-btn" onClick={() => reset(false)} disabled={solving}>
+            RESET
+          </button>
         </div>
+
+        {/* row 2: hint + a* solve */}
+        <div className="pz-actions2">
+          <button
+            className="pz-btn"
+            style={{ background: "#f57f17", color: "#fff", borderColor: "transparent" }}
+            onClick={handleHint}
+            disabled={won || solving}
+          >
+            HINT
+          </button>
+          <button
+            className="pz-btn"
+            style={
+              solving
+                ? { background: "#c62828", color: "#fff", borderColor: "transparent" }
+                : { background: "#1565c0", color: "#fff", borderColor: "transparent" }
+            }
+            onClick={handleSolve}
+            disabled={won && !solving}
+          >
+            {solving ? "STOP" : "A* SOLVE"}
+          </button>
+        </div>
+
+        <p className={`pz-info${solving ? " solving" : ""}`}>{statusMsg}</p>
       </div>
     </>
   );
